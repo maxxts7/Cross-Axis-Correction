@@ -1,4 +1,4 @@
-# Cross-Axis Capping
+# Cross-Axis Correction
 
 Decoupling jailbreak detection from correction in LLM activation space — see [docs/OVERVIEW.md](docs/OVERVIEW.md) for what this project is, the folder map, and how the capping mechanism works.
 
