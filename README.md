@@ -39,11 +39,10 @@ chmod +x scripts/launchers/run_qwen.sh
 ./scripts/launchers/run_qwen.sh full                # the real run (250 + 100 prompts)
 ```
 
-Output lands in `results/crosscap_qwen_<preset>_<flags>/`. Then:
+Output lands in `results/crosscap_qwen_<preset>_<flags>/`. For bootstrap CIs:
 
 ```bash
-./scripts/analysis/run_reclassify.sh <output-dir>           # add llm_label column
-python -m crosscap.analysis.bootstrap_results <output-dir>  # 95% CIs
+python -m crosscap.analysis.bootstrap_results <output-dir>
 ```
 
 ## Run — Llama-3.3-70B end-to-end
@@ -57,10 +56,7 @@ Llama needs outcome-labelled calibration first because the published assistant a
 # 2. Run the experiment (auto-uses data/calibration/ if it exists)
 ./scripts/launchers/run_llama.sh full                       # writes results/crosscap_llama_…/
 
-# 3. The launcher already calls reclassify; if you skipped it, run:
-./scripts/analysis/run_reclassify.sh results/crosscap_llama_…/
-
-# 4. Bootstrap CIs over the finished run
+# 3. Bootstrap CIs over the finished run
 python -m crosscap.analysis.bootstrap_results results/crosscap_llama_…/
 ```
 
