@@ -11,9 +11,7 @@ This project asks: **what if we use two separate axes?**
 - **Assistant-axis capping** — same direction detects and corrects.
 - **Cross-axis capping** — detects on the assistant axis, but corrects along a separate **compliance axis** derived from PCA on the model's own refusing vs. compliant activations.
 
-Tested on Qwen3-32B and Llama-3.3-70B-Instruct, cross-axis capping nearly doubles the jailbreak refusal rate (Qwen 32.9% → 54.5%; Llama 20.6% → 48.1%) while preserving 91–98% of benign output quality, with no additional compute. See [RESULTS.md](RESULTS.md) for the full numbers.
-
-This project was done as part of the BlueDot Technical AI Safety project sprint. Compute costs were covered by Rapid Grants. Reach out at manuxtmail@gmail.com if anything in here is unclear.
+Tested on Qwen3-32B and Llama-3.3-70B-Instruct, cross-axis capping nearly doubles the jailbreak refusal rate (Qwen 32.9% → 54.5%; Llama 20.6% → 48.1%) while preserving 91–98% of benign output quality, with no additional compute.
 
 ## Folder map
 
