@@ -1,0 +1,184 @@
+#!/bin/bash
+# Run the cross-axis capping experiment on Llama-3.3-70B-Instruct, then
+# auto-reclassify the result CSVs (HarmBench for jailbreak files, Claude
+# for benign files).
+#
+# Auto-behaviours when MODEL is Llama:
+#   * compliance axis is built from data/calibration/{refusing,compliant}.csv
+#     if that directory exists; falls back to JBB+WJ otherwise.
+#   * reclassify_refusals.py runs with --backend harmbench (jailbreaks scored
+#     locally; benign files still need Claude).
+#
+# Note: Llama-3.3-70B in bf16 needs ~140 GB of GPU memory. device_map="auto"
+# will spread layers across visible GPUs; make sure CUDA_VISIBLE_DEVICES
+# exposes enough of them (typically 2+ H100/A100-80GB or 4+ smaller).
+# HarmBench-Llama-2-13b-cls loads after generation finishes and adds ~30 GB.
+#
+# Usage:
+#   chmod +x run_llama.sh
+#   ./run_llama.sh                                            # full run, defaults, reclassify
+#   ./run_llama.sh sanity                                     # smoke test
+#   ./run_llama.sh full optimal                               # midpoint threshold
+#   ./run_llama.sh full p25                                   # 25th percentile threshold
+#   ./run_llama.sh full mean+std benign-p1                    # tighter detect gate
+#   ./run_llama.sh full optimal75 benign-p1 no                # skip reclassify step
+#   ./run_llama.sh sanity optimal75 benign-p10 yes mean_diff  # mean-diff axis
+#   ./run_llama.sh full 16                                    # literal tau=16, default L40-L70
+#   ./run_llama.sh full optimal75 benign-p1 yes pca ""        # fall back to paper L56-L71 only
+#   ./run_llama.sh full optimal75 benign-p1 yes pca 30-70     # different override range
+#   ./run_llama.sh full optimal75 benign-p1 yes pca 40-65 50 50  # 50 jailbreak + 50 benign
+#   ./run_llama.sh full optimal75 4 yes pca 40-65 5 5         # smoke test, literal detect tau
+#
+# Compliance threshold options:  optimal75 (default), optimal, optimal90, optimal20, mean+std, mean, p25,
+#                                 OR a literal number (e.g. 16) -> used as tau on every cap layer
+# Cross-detect method options:   benign-p1 (default), benign-p5, benign-p10,
+#                                 OR a literal number (e.g. 4) -> used as tau on every cap layer
+# Reclassify options:            yes (default), no
+# Axis method options:           pca (default), mean_diff
+# Compliance-layer override:     default "40-70" inclusive -- Mode 3 cross-cap extends down to L40
+#                                 (Mode 2 assistant-cap stays on the paper's L56-L71). Pass "" to
+#                                 disable the override and use paper L56-L71 for both modes.
+# N-jailbreak / N-benign:        positional 7 and 8. Empty (default) = use the preset value.
+#                                 Set either to override just the prompt counts without changing
+#                                 the preset (e.g. preset=full but only 5+5 prompts for a smoke run).
+
+set -e
+
+# Resolve project root (this script lives at scripts/launchers/), then cd
+# there so all relative paths (data/, results/, etc.) resolve consistently.
+cd "$(dirname "$0")/../.."
+
+# Enable the fast Rust-based HF downloader. Without this, 70B shard pulls
+# fall back to the slow single-threaded path and look stuck for minutes.
+# hf_transfer must be installed in the active Python env (pip install hf_transfer).
+export HF_HUB_ENABLE_HF_TRANSFER=1
+
+# Paste your key between the quotes for unattended runs. Leave empty to
+# fall back to env var / .env / interactive prompt. Don't commit a real
+# key -- this file is tracked in git. Only used by the reclassify step
+# (for benign files; jailbreak files use HarmBench locally).
+ANTHROPIC_API_KEY_OVERRIDE=""
+
+PRESET="${1:-sanity}"
+THRESHOLD="${2:-12}"
+CROSS_DETECT="${3:--8}"
+RECLASSIFY="${4:-yes}"
+AXIS_METHOD="${5:-pca}"
+# Default cross-cap (Mode 3) range is L40-L70 -- wider than the paper's L56-L71.
+# Pass "" as the 6th arg to fall back to the paper's published range.
+COMPLIANCE_LAYERS="${6-40-65}"
+# Optional prompt-count overrides. Empty = use the preset's N_PROMPTS /
+# N_BENIGN_EVAL. Useful for ad-hoc subsamples without editing the preset.
+N_JAILBREAK="${7:-10}"
+N_BENIGN="${8:-10}"
+# Sticky detect (Mode 3): once the assistant-axis projection falls below
+# tau_detect at a given layer, keep that layer's detect gate open for the
+# rest of the generation. The compliance correction gate is still checked
+# every step. Pass "yes" to enable; default "no" preserves the original
+# step-by-step behaviour.
+STICKY_DETECT="${9:-yes}"
+MODEL="meta-llama/Llama-3.3-70B-Instruct"
+LAYER_TAG=""
+if [ -n "$COMPLIANCE_LAYERS" ]; then
+    LAYER_TAG="_L${COMPLIANCE_LAYERS}"
+fi
+COUNT_TAG=""
+if [ -n "$N_JAILBREAK" ] || [ -n "$N_BENIGN" ]; then
+    # Mark the output dir so a 5+5 smoke run doesn't overwrite a 250+100 full run.
+    COUNT_TAG="_n${N_JAILBREAK:-preset}-${N_BENIGN:-preset}"
+fi
+STICKY_TAG=""
+if [ "$STICKY_DETECT" = "yes" ]; then
+    STICKY_TAG="_sticky"
+fi
+OUTPUT_DIR="results/crosscap_llama_${PRESET}_${THRESHOLD}_${CROSS_DETECT}_${AXIS_METHOD}${LAYER_TAG}${COUNT_TAG}${STICKY_TAG}"
+
+# API key resolution for the reclassify step. Captured upfront so the long
+# generation can run unattended; benign reclassify needs it at the end.
+# Skipped entirely if RECLASSIFY=no.
+KEY_INFO="not needed (reclassify disabled)"
+if [ "$RECLASSIFY" = "yes" ]; then
+    if [ -n "$ANTHROPIC_API_KEY_OVERRIDE" ]; then
+        ANTHROPIC_API_KEY="$ANTHROPIC_API_KEY_OVERRIDE"
+    fi
+    if [ -z "$ANTHROPIC_API_KEY" ] && [ -f .env ]; then
+        # shellcheck disable=SC1091
+        set -a
+        . ./.env
+        set +a
+    fi
+    if [ -z "$ANTHROPIC_API_KEY" ]; then
+        echo "ANTHROPIC_API_KEY not found in env, .env, or script override."
+        echo "Reclassify needs it for benign files (jailbreaks use HarmBench locally)."
+        printf "Enter ANTHROPIC_API_KEY (hidden, or just press Enter to skip reclassify): "
+        read -rs ANTHROPIC_API_KEY
+        echo ""
+        if [ -z "$ANTHROPIC_API_KEY" ]; then
+            echo "No key provided -- reclassify will be skipped after the run."
+            RECLASSIFY="no"
+            KEY_INFO="skipped (no key)"
+        else
+            export ANTHROPIC_API_KEY
+            KEY_INFO="set (${#ANTHROPIC_API_KEY} chars)"
+        fi
+    else
+        export ANTHROPIC_API_KEY
+        KEY_INFO="set (${#ANTHROPIC_API_KEY} chars)"
+    fi
+fi
+
+CALIB_INFO="default (JBB + WildJailbreak)"
+if [ -d data/calibration ]; then
+    CALIB_INFO="data/calibration/ (outcome-labelled)"
+fi
+
+echo "============================================"
+echo "  Cross-Axis Capping -- Llama-3.3-70B"
+echo "  Preset:               ${PRESET}"
+echo "  Compliance threshold: ${THRESHOLD}"
+echo "  Cross-detect method:  ${CROSS_DETECT}"
+echo "  Axis method:          ${AXIS_METHOD}"
+echo "  Compliance layers:    ${COMPLIANCE_LAYERS:-paper default (L56-L71)}"
+if [ -n "$COMPLIANCE_LAYERS" ]; then
+    echo "  Mode 2 (assistant-cap): runs on paper layers (L56-L71); cross-cap (Mode 3) on the override range"
+fi
+echo "  N jailbreak:          ${N_JAILBREAK:-preset default}"
+echo "  N benign:             ${N_BENIGN:-preset default}"
+echo "  Sticky detect (M3):   ${STICKY_DETECT}"
+echo "  Calibration:          ${CALIB_INFO}"
+echo "  Reclassify:           ${RECLASSIFY}"
+echo "  Anthropic key:        ${KEY_INFO}"
+echo "  Output:               ${OUTPUT_DIR}"
+echo "============================================"
+echo ""
+
+EXTRA_ARGS=()
+if [ -n "$COMPLIANCE_LAYERS" ]; then
+    EXTRA_ARGS+=(--compliance-layers "$COMPLIANCE_LAYERS")
+fi
+if [ -n "$N_JAILBREAK" ]; then
+    EXTRA_ARGS+=(--n-jailbreak "$N_JAILBREAK")
+fi
+if [ -n "$N_BENIGN" ]; then
+    EXTRA_ARGS+=(--n-benign "$N_BENIGN")
+fi
+if [ "$STICKY_DETECT" = "yes" ]; then
+    EXTRA_ARGS+=(--sticky-detect)
+fi
+
+python -m crosscap.core.run_crosscap \
+    --preset "$PRESET" \
+    --model "$MODEL" \
+    --compliance-threshold="$THRESHOLD" \
+    --cross-detect-method="$CROSS_DETECT" \
+    --axis-method "$AXIS_METHOD" \
+    --output-dir "$OUTPUT_DIR" \
+    "${EXTRA_ARGS[@]}"
+
+if [ "$RECLASSIFY" = "yes" ]; then
+    echo ""
+    echo "── Reclassify (HarmBench for jailbreaks, Claude for benigns) ───────"
+    python -m crosscap.analysis.reclassify_refusals \
+        --input-dir "$OUTPUT_DIR" \
+        --backend anthropic
+fi

@@ -1,250 +1,118 @@
 # Cross-Axis Capping
 
-An exploratory study on separating jailbreak detection from correction in LLM activation space.
+Decoupling jailbreak detection from correction in LLM activation space — see [docs/OVERVIEW.md](docs/OVERVIEW.md) for what this project is, the folder map, and how the capping mechanism works.
 
-This project was done as part of the BlueDot Technical AI Safety project sprint. Compute costs were covered by Rapid Grants.
-
-I have tried to explain everything in detail throughout this document and the codebase. If you find any information missing or the structure hard to follow, please reach out to me at manuxtmail@gmail.com.
-
-## What is this?
-
-When a large language model (LLM) generates text, its internal "hidden states" carry directional signals that indicate whether it's about to comply with or refuse a request. Safety researchers have found that you can nudge a model toward refusal by **capping** these signals along a known direction (the "assistant axis").
-
-The standard approach uses **one axis** for both detecting a jailbreak and correcting the model's behavior. This project asks: **what if we use two separate axes instead?**
-
-- **Assistant-axis capping** (the standard): uses the same direction to spot a jailbreak and to push the model toward refusal.
-- **Cross-axis capping** (the new idea): spots the jailbreak on the assistant axis, but corrects using a different "compliance axis" derived from PCA on the model's own refusing vs. compliant activations.
-
-We test both methods on **Qwen/Qwen3-32B** across 100 jailbreak prompts and 50 benign prompts, then use Claude Sonnet as an automated judge to classify each output.
-
-## What did we find?
-
-| Metric | Assistant-Axis | Cross-Axis |
-|---|---|---|
-| Jailbreak refusal rate | 28% | **55%** |
-| Jailbreak compliance rate | 59% | **29%** |
-| Benign output preserved | 62% | 62% |
-| Benign output degraded | 6% | 6% |
-
-Cross-axis capping nearly doubles the refusal rate while halving compliance -- and it does this with **no additional cost** to benign output quality.
-
-## Repository Structure
-
-```
-crosscap_experiment.py      Core library (model loading, capping hooks, axis math, generation)
-run_crosscap.py             Main script that orchestrates the experiment
-reclassify_refusals.py      Post-hoc LLM judge (sends outputs to Claude Sonnet for labeling)
-run_parallel.sh             Convenience script for multi-GPU runs
-requirements.txt            Python dependencies
-Final Results/              CSVs and metadata from the completed experiment
-final_analysis_summary.txt  Plain-text summary of all results
-```
+This README covers install and run only.
 
 ## Prerequisites
 
-- **Python 3.10+**
-- **A CUDA GPU** with enough memory for Qwen3-32B (80 GB+ VRAM recommended)
-- **An Anthropic API key** (only needed for the LLM-judge reclassification step)
+- Python 3.10+
+- A CUDA GPU with enough memory for the target model (≥80 GB VRAM for Qwen3-32B; multiple GPUs for Llama-3.3-70B in bf16)
+- `HF_TOKEN` set in the environment (HuggingFace), with access to gated models like Llama-3.3
+- `ANTHROPIC_API_KEY` set in the environment (only for the LLM-judge step on benign outputs)
 
-## Setup
+## Install
 
-Follow these steps in order to avoid dependency errors.
-
-### 1. Clone the repository
-
-```bash
-git clone <repo-url> && cd cross_capping
-```
-
-### 2. Install the HuggingFace CLI
-
-The experiment downloads models, datasets, and pre-computed axes from HuggingFace, so you need the CLI installed and authenticated first.
-
-**Linux / macOS (bash):**
-```bash
-curl -LsSf https://hf.co/cli/install.sh | bash
-```
-
-**Windows (PowerShell):**
-```powershell
--ExecutionPolicy ByPass -c "irm https://hf.co/cli/install.ps1 | iex"
-```
-
-### 3. Log in to HuggingFace
+On a fresh machine, the bootstrap script handles HF CLI, hf_transfer, flash-attn, dependencies, and the package install in one go:
 
 ```bash
-hf auth login
+chmod +x scripts/setup/bootstrap.sh
+./scripts/setup/bootstrap.sh
+hf auth login            # paste your HF token when prompted
 ```
 
-This will prompt you for an access token. You can create one at [huggingface.co/settings/tokens](https://huggingface.co/settings/tokens).
-
-### 4. Install Flash Attention
-
-Flash Attention needs to be installed separately before the rest of the dependencies, otherwise the build can fail:
+If you'd rather do it manually:
 
 ```bash
 pip install flash-attn --no-build-isolation
-```
-
-### 5. Install the remaining dependencies
-
-```bash
 pip install -r requirements.txt
+pip install -e .         # installs the crosscap package so `python -m crosscap.…` works
 ```
 
-### 6. Set your Anthropic API key (optional)
+## Run — Qwen3-32B (single GPU, no calibration step)
 
-Only needed if you plan to run the LLM-judge reclassification step:
+Qwen has a published assistant axis on HuggingFace, so you can skip calibration:
 
 ```bash
-export ANTHROPIC_API_KEY="sk-ant-..."
+chmod +x scripts/launchers/run_qwen.sh
+./scripts/launchers/run_qwen.sh sanity              # smoke test (5 prompts)
+./scripts/launchers/run_qwen.sh full                # the real run (250 + 100 prompts)
 ```
 
-## Running the Experiment
-
-### 1. Quick smoke test (5 prompts, fastest way to verify everything works)
+Output lands in `results/crosscap_qwen_<preset>_<flags>/`. Then:
 
 ```bash
-python run_crosscap.py --preset sanity
+./scripts/analysis/run_reclassify.sh <output-dir>           # add llm_label column
+python -m crosscap.analysis.bootstrap_results <output-dir>  # 95% CIs
 ```
 
-### 2. Full run on a single GPU
+## Run — Llama-3.3-70B end-to-end
+
+Llama needs outcome-labelled calibration first because the published assistant axis isn't tuned for it:
 
 ```bash
-python run_crosscap.py --preset full
+# 1. Build the labelled calibration set (writes data/calibration/refusing.csv + compliant.csv)
+./scripts/calibration/build_calibration.sh both 200 harmbench
+
+# 2. Run the experiment (auto-uses data/calibration/ if it exists)
+./scripts/launchers/run_llama.sh full                       # writes results/crosscap_llama_…/
+
+# 3. The launcher already calls reclassify; if you skipped it, run:
+./scripts/analysis/run_reclassify.sh results/crosscap_llama_…/
+
+# 4. Bootstrap CIs over the finished run
+python -m crosscap.analysis.bootstrap_results results/crosscap_llama_…/
 ```
 
-### 3. Full run across multiple GPUs (recommended)
+## Multi-GPU runs
 
-The easiest way:
+`scripts/launchers/run_parallel.sh` runs the 3-stage pipeline (warmup → per-GPU chunks → merge) automatically:
 
 ```bash
-./run_parallel.sh full 4    # uses 4 GPUs
+./scripts/launchers/run_parallel.sh full 4    # 4-way data parallelism
+./scripts/launchers/run_parallel.sh sanity 2  # smoke test on 2 GPUs
 ```
 
-Or do it manually in three steps:
+If you need finer control, the same three stages by hand:
 
 ```bash
-# Step 1 -- warmup: downloads everything, computes axes and thresholds (run once)
-python run_crosscap.py --preset full --warmup
-
-# Step 2 -- generate: run one chunk per GPU in parallel
-CUDA_VISIBLE_DEVICES=0 python run_crosscap.py --preset full --chunk 0/4 &
-CUDA_VISIBLE_DEVICES=1 python run_crosscap.py --preset full --chunk 1/4 &
-CUDA_VISIBLE_DEVICES=2 python run_crosscap.py --preset full --chunk 2/4 &
-CUDA_VISIBLE_DEVICES=3 python run_crosscap.py --preset full --chunk 3/4 &
+python -m crosscap.core.run_crosscap --preset full --warmup
+CUDA_VISIBLE_DEVICES=0 python -m crosscap.core.run_crosscap --preset full --chunk 0/4 &
+CUDA_VISIBLE_DEVICES=1 python -m crosscap.core.run_crosscap --preset full --chunk 1/4 &
+CUDA_VISIBLE_DEVICES=2 python -m crosscap.core.run_crosscap --preset full --chunk 2/4 &
+CUDA_VISIBLE_DEVICES=3 python -m crosscap.core.run_crosscap --preset full --chunk 3/4 &
 wait
-
-# Step 3 -- merge: combine chunk CSVs into the four final output files
-python run_crosscap.py --preset full --merge
+python -m crosscap.core.run_crosscap --preset full --merge
 ```
 
-### 4. Classify outputs with the LLM judge
+## Sweeps & diagnostics
 
-After generation, have Claude Sonnet label each output:
+Exploratory scripts off the critical path — useful when you want to understand what a run is doing, not when you just want to reproduce a number.
+
+| Script | What it sweeps |
+|---|---|
+| `scripts/sweeps/run_steer_probe.sh` | Direct steering on the compliance axis at fixed targets — does forcing the projection flip a benign prompt to refusal? |
+| `scripts/sweeps/run_steer_layer_sweep.sh` | Layer ranges × steering targets — is the refusal basin a property of the late band only? |
+| `scripts/sweeps/run_steer_layer_sweep_mixed.sh` | Same, on a mixed prompt set (5 benign + 5 jailbreak + 5 adversarial). |
+| `scripts/sweeps/run_steer_layer_sweep_mixed_lowsweep.sh` | Same, but sweeping low targets (2, 4, 5, 7) to find the gentle-zone boundary. |
+| `scripts/sweeps/run_steer_layer_sweep_jbb_compliance.sh` | JBB-only, steering toward the compliance pole (negative targets). Does it flip refused prompts to compliance? |
+| `scripts/sweeps/run_steer_scopes.sh` | Same axes, four clamp scopes — `all`, `prefill_only`, `first_token_only`, `cursor_plus_first`. |
+| `scripts/sweeps/run_sweep_detect.sh` | Sweeps absolute values of the assistant-axis detection threshold, with optional reclassification per τ. |
+
+## Re-running analysis on an existing run
+
+Point each tool at the run directory the launcher produced (e.g. `results/crosscap_qwen_full_…/`):
 
 ```bash
-python reclassify_refusals.py            # full run
-python reclassify_refusals.py --resume   # pick up where you left off
-python reclassify_refusals.py --summary-only  # just print stats from existing labels
+# 95% bootstrap CIs (no GPU needed — pure CSV math)
+python -m crosscap.analysis.bootstrap_results <run-dir>
+
+# Re-judge the outputs (optionally with a different judge model)
+./scripts/analysis/run_reclassify.sh <run-dir>
+
+# Per-layer axis diagnostics from a warmup.pt
+python -m crosscap.analysis.diagnose_axes --warmup <run-dir>/warmup.pt
 ```
-
-### 5. View summary statistics
-
-```bash
-python analyze_csvs.py
-```
-
-## How the Pipeline Fits Together
-
-```
- WARMUP
- ──────
-   Download model, datasets, and assistant axis from HuggingFace
-   Collect activations from 50 "refusing" + 50 "compliant" runs
-   Compute PCA compliance axis and per-layer detection thresholds
-   Save everything to warmup.pt
-          │
-          ▼
- GENERATION
- ──────────
-   For each of the 150 prompts (100 jailbreak + 50 benign):
-     1. Generate a baseline response (no capping)
-     2. Generate an assistant-capped response
-     3. Generate a cross-capped response
-   Record which layers fired and the per-layer projection values
-          │
-          ▼
- MERGE
- ─────
-   Combine per-chunk CSVs into four final files:
-     assistant_cap_jailbreak.csv    assistant_cap_benign.csv
-     cross_cap_jailbreak.csv        cross_cap_benign.csv
-          │
-          ▼
- RECLASSIFICATION (LLM JUDGE)
- ────────────────────────────
-   Send each capped output to Claude Sonnet for labeling:
-     Jailbreak outputs  →  refusal / compliance / partial_refusal / degraded
-     Benign outputs     →  unchanged / false_refusal / degraded
-   Produces *_reclassified.csv files with llm_label column
-```
-
-## Presets
-
-| Preset | Jailbreak prompts | Benign prompts | Max tokens | When to use |
-|---|---|---|---|---|
-| `sanity` | 5 | 10 | 64 | Smoke test -- does it run at all? |
-| `small` | 20 | 20 | 128 | Development and debugging |
-| `full` | 100 | 50 | 256 | The real experiment |
-| `full_meandiff` | 100 | 50 | 256 | Variant using mean-difference axis instead of PCA |
-
-## Key Configuration
-
-These live at the top of `run_crosscap.py`:
-
-| Parameter | Default | What it controls |
-|---|---|---|
-| `MODEL_NAME` | `Qwen/Qwen3-32B` | Which model to cap |
-| `CAP_LAYERS` | L46--L53 (8 layers) | Where in the network capping is applied (72--84% depth) |
-| `AXIS_METHOD` | `pca` | How the compliance axis is built (`pca` or `mean_diff`) |
-
-## How Capping Works (briefly)
-
-During text generation the model builds up a hidden state **h** at each layer. Capping modifies **h** in-place:
-
-**Single-axis (assistant) capping:**
-> If **h** projects below a threshold on the assistant axis **v**, push it back:
-> `h = h - v * min(dot(h, v) - threshold, 0)`
-
-**Cross-axis capping:**
-> **Detect** on the assistant axis (same threshold check), but **correct** along a separate compliance axis **c**:
-> `h = h - c * min(dot(h, c) - threshold_c, 0)`
-
-The compliance axis is built by running PCA on hidden states the model produces when it refuses harmful requests vs. when it complies.
-
-## Datasets
-
-All downloaded automatically from HuggingFace:
-
-| Dataset | Role in the experiment |
-|---|---|
-| [JBB-Behaviors](https://huggingface.co/datasets/JailbreakBench/JBB-Behaviors) | Bare harmful goals -- used to collect "refusing" activations |
-| [WildJailbreak](https://huggingface.co/datasets/allenai/wildjailbreak) | Adversarial jailbreak prompts for evaluation, plus "compliant" activations from the train split |
-| [assistant-axis-vectors](https://huggingface.co/datasets/lu-christina/assistant-axis-vectors) | Pre-computed assistant axis at layer 53 |
-
-## Output CSV Format
-
-Each row is one prompt. Key columns:
-
-| Column | Description |
-|---|---|
-| `prompt_text` | The input prompt |
-| `baseline_text` | What the model said with no intervention |
-| `{method}_cap_applied` | Did the capping fire? (`Yes` / `No`) |
-| `{method}_cap_layers` | Which layers fired (e.g. `L46,L47,L48`) |
-| `{method}_cap_text` | What the model said with capping active |
-| `llm_label` | Judge's classification (added during reclassification) |
 
 ## License
 
