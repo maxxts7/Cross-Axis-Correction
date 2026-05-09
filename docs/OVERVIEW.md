@@ -106,8 +106,4 @@ Each row is one prompt. Key columns:
 | `{method}_cap_text` | Output with capping active |
 | `llm_label` | Judge's classification (added by `reclassify_refusals`) |
 
-## Where to read next
 
-- [RESULTS.md](RESULTS.md) — full results with bootstrap CIs and per-run interpretation.
-- [analysis_plan.md](analysis_plan.md) — five-step diagnostic framework (axis alignment, calibration shape, magnitude vs. direction, per-token trajectories, clamp persistence).
-- [`../notebooks/primer.ipynb`](../notebooks/primer.ipynb) — annotated walkthrough.
